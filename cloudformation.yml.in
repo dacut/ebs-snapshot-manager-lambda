@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Manage EBS snapshots automatically
+Parameters:
+  FrequencyTagName:
+    Type: String
+    Default: Snapshot Frequency
+    Description: The tag to look for on instances whose volumes should be automatically snapshotted.
+  RetentionTagName:
+    Type: String
+    Default: Snapshot Retention
+    Description: The tag to use for deciding snapshot retention values.
+  NextSnapshotTimeTagName:
+    Type: String
+    Default: Next Snapshot Time
+    Description: The tag to apply to volumes that have had a snapshot taken.
+  ExpirationTimeTagname:
+    Type: String
+    Default: Expiration Time
+    Description: The tag to apply to generated snapshots.
+  DefaultRetention:
+    Type: String
+    Default: 14d
+    Description: The default retention to apply to instance volumes if the retention tag is not specified.
+Resources:
+  EbsVolumeQueue:
+    # The queue to place volume ids that need to be examined into.
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 120
+  InstanceManagerLambdaRole:
+    # Permissions needed by the instance-manager Lambda function.
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: EC2-Permissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                Resource: "*"
+        - PolicyName: SQS-Permissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt EbsVolumeQueue.Arn
+  InstanceManagerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          @include(instance-manager.py)
+      Description: EBS Snapshot Manager Instance Manager
+      Environment:
+        Variables:
+          DEFAULT_RETENTION: !Ref DefaultRetention
+          FREQUENCY_TAG_NAME: !Ref FrequencyTagName
+          RETENTION_TAG_NAME: !Ref RetentionTagName
+          VOLUME_QUEUE_URL: !Ref EbsVolumeQueue
+      Handler: index.check_instances
+      MemorySize: 512
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt InstanceManagerLambdaRole.Arn
+      Runtime: python3.6
+      Timeout: 300
