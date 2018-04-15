@@ -99,6 +99,3 @@ ENV/
 
 # mypy
 .mypy_cache/
-
-# Ignore the generated cloudformation.yml.
-cloudformation.yml

@@ -2,7 +2,7 @@
 import boto3
 from datetime import datetime, timedelta
 import json
-from logging import getLogger
+from logging import getLogger, DEBUG, INFO
 from os import environ
 from re import compile as re_compile
 from typing import Any, Dict
@@ -14,22 +14,26 @@ volume_queue_url = environ["VOLUME_QUEUE_URL"]
 exit_time_millis = 30000
 
 log = getLogger()
+log.setLevel(DEBUG)
+getLogger("boto3").setLevel(INFO)
+getLogger("botocore").setLevel(INFO)
 ec2 = boto3.client("ec2")
 sqs = boto3.resource("sqs")
 queue = sqs.Queue(volume_queue_url)
 
-iso8601_period_regex = re.compile(
-    r"P"
-    r"(?:(?P<weeks>[0-9]+)W|"
+iso8601_period_regex = re_compile(
+    r"P(?:"
+    r"(?:(?P<weeks>[0-9]+)W)|"
     r"(?:(?P<years>[0-9]+)Y)?"
     r"(?:(?P<months>[0-9]+)M)?"
     r"(?:(?P<days>[0-9]+)D)?"
     r"(?:T(?:(?P<hours>[0-9]+)H)?)?"
+    r")"
 )
-simplified_period_regex = re.compile(
+simplified_period_regex = re_compile(
     r"(?P<years>)(?P<months>)"
     r"(?:(?P<weeks>[0-9]+)[Ww])?\s*"
-    r"(?:(?P<days>[0-9]+)[Dd])?\s"
+    r"(?:(?P<days>[0-9]+)[Dd])?\s*"
     r"(?:(?P<hours>[0-9]+)[Hh])?"
 )
 
@@ -41,10 +45,12 @@ def lambda_handler(event, context) -> None:
     if not action:
         raise ValueError("Action was not specified in the Lambda event.")
 
+    log.info("Action: %r", action)
+
     if action == "CheckInstances":
-        return check_instances()
+        return check_instances(event, context)
     elif action == "CheckVolumes":
-        return check_volumes()
+        return check_volumes(event, context)
 
     raise ValueError("Unknown action %r" % action)
 
@@ -65,7 +71,7 @@ def parse_duration_string(s: str) -> timedelta:
     if not m:
         m = simplified_period_regex.match(s)
         if not m:
-            raise ValueError("Cannot parse time period %r" % s)
+            raise ValueError("Cannot parse time period: %r" % s)
 
     try:
         years = int(m.group("years") or "0")
@@ -74,16 +80,16 @@ def parse_duration_string(s: str) -> timedelta:
         days = int(m.group("days") or "0")
         hours = int(m.group("hours") or "0")
     except:
-        raise ValueError("Cannot parse time period %r" % s)
+        raise ValueError("Cannot parse time period: %r" % s)
 
     duration = timedelta(
         days=(365 * years + 30 * months + days), weeks=weeks, hours=hours)
     if duration <= timedelta(seconds=0):
-        raise ValueError("Time period must be greater than 0")
+        raise ValueError("Time period must be greater than 0: %r" % s)
 
     return duration
 
-def check_instances():
+def check_instances(event, context) -> None:
     """
     Look for instances that have automatic snapshots applied.
     """
@@ -143,7 +149,7 @@ def check_instances():
 
     return
 
-def check_volumes(event, context):
+def check_volumes(event, context) -> None:
     """
     Look for instances that have automatic snapshots applied.
     """
@@ -171,9 +177,9 @@ def check_volumes(event, context):
 
     return
 
-def handle_volume_message(message: Dict[str, Any]) -> None:
+def handle_volume_message(message: 'boto3.resources.factory.sqs.Message') -> None:
     """
-    handle_volume_message(message: Dict[str, Any]) -> None
+    handle_volume_message(message: boto3.resources.factory.sqs.Message) -> None
     Handle an EBS volume message from SQS.
     """
     msg_body = json.loads(message.body)

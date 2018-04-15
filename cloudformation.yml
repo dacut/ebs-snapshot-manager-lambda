@@ -9,14 +9,6 @@ Parameters:
     Type: String
     Default: Snapshot Retention
     Description: The tag to use for deciding snapshot retention values.
-  NextSnapshotTimeTagName:
-    Type: String
-    Default: Next Snapshot Time
-    Description: The tag to apply to volumes that have had a snapshot taken.
-  ExpirationTimeTagname:
-    Type: String
-    Default: Expiration Time
-    Description: The tag to apply to generated snapshots.
   DefaultRetention:
     Type: String
     Default: 14d
@@ -27,7 +19,7 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       VisibilityTimeout: 120
-  InstanceManagerLambdaRole:
+  LambdaRole:
     # Permissions needed by the instance-manager Lambda function.
     Type: AWS::IAM::Role
     Properties:
@@ -48,7 +40,11 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
+                  - ec2:CreateSnapshot
+                  - ec2:CreateTags
+                  - ec2:DeleteSnapshot
                   - ec2:DescribeInstances
+                  - ec2:DescribeSnapshots
                 Resource: "*"
         - PolicyName: SQS-Permissions
           PolicyDocument:
@@ -56,14 +52,26 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
+                  - sqs:DeleteMessage
+                  - sqs:ReceiveMessage
                   - sqs:SendMessage
                 Resource: !GetAtt EbsVolumeQueue.Arn
-  InstanceManagerLambdaFunction:
+        - PolicyName: CloudWatchLogs-Permissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+  LambdaFunction:
     Type: AWS::Lambda::Function
     Properties:
       Code:
-        ZipFile: |
-          @include(instance-manager.py)
+        S3Bucket: @BUCKET_NAME@
+        S3Key: @ZIP_OBJ_NAME@
       Description: EBS Snapshot Manager Instance Manager
       Environment:
         Variables:
@@ -71,9 +79,29 @@ Resources:
           FREQUENCY_TAG_NAME: !Ref FrequencyTagName
           RETENTION_TAG_NAME: !Ref RetentionTagName
           VOLUME_QUEUE_URL: !Ref EbsVolumeQueue
-      Handler: index.check_instances
+      Handler: ebs_snapshot_manager.lambda_handler
       MemorySize: 512
-      ReservedConcurrentExecutions: 1
-      Role: !GetAtt InstanceManagerLambdaRole.Arn
+      ReservedConcurrentExecutions: 2
+      Role: !GetAtt LambdaRole.Arn
       Runtime: python3.6
       Timeout: 300
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledInvocation.Arn
+  ScheduledInvocation:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Invoke the EBS Snapshot Manager every 5 minutes
+      ScheduleExpression: "rate(5 minutes)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: InstanceManager
+          Input: "{\"Action\": \"CheckInstances\"}"
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: VolumeManager
+          Input: "{\"Action\": \"CheckVolumes\"}"
