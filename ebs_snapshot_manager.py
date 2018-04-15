@@ -5,18 +5,23 @@ import json
 from logging import getLogger, DEBUG, INFO
 from os import environ
 from re import compile as re_compile
+from time import sleep
 from typing import Any, Dict, Set
 
+cloudwatch_namespace = environ.get("CLOUDWATCH_NAMESPACE", "SnapshotManager")
 default_retention = environ.get("DEFAULT_RETENTION", "14d")
 frequency_tag_name = environ["FREQUENCY_TAG_NAME"]
 retention_tag_name = environ["RETENTION_TAG_NAME"]
 volume_queue_url = environ["VOLUME_QUEUE_URL"]
 exit_time_millis = 30000
+max_retries = 5
+retry_sleep = 0.01
 
 log = getLogger()
 log.setLevel(DEBUG)
 getLogger("boto3").setLevel(INFO)
 getLogger("botocore").setLevel(INFO)
+cw = boto3.client("cloudwatch")
 ec2 = boto3.client("ec2")
 sqs = boto3.resource("sqs")
 queue = sqs.Queue(volume_queue_url)
@@ -37,10 +42,14 @@ simplified_period_regex = re_compile(
     r"(?:(?P<hours>[0-9]+)[Hh])?"
 )
 
+pending_metrics = {}
+
 def lambda_handler(event, context) -> None:
     """
     Main entrypoint to the Lambda handler.
     """
+    global pending_metrics
+
     action = event.get("Action")
     if not action:
         raise ValueError("Action was not specified in the Lambda event.")
@@ -51,7 +60,6 @@ def lambda_handler(event, context) -> None:
         return check_instances(event, context)
     elif action == "CheckVolumes":
         return check_volumes(event, context)
-
     raise ValueError("Unknown action %r" % action)
 
 def parse_duration_string(s: str) -> timedelta:
@@ -105,8 +113,21 @@ def check_instances(event, context) -> None:
     # DescribeInstances returns a limited set of results, so we need to
     # paginate through them.
     while True:
-        result = ec2.describe_instances(**describe_kw)
+        for retry in range(max_retries):
+            try:
+                result = ec2.describe_instances(**describe_kw)
+                break
+            except Exception as e:
+                log.error("Failed to call EC2:DescribeInstances: %s", e,
+                           exc_info=True)
+                if retry == max_retries - 1:
+                    raise
+
+                sleep(retry_sleep ** (retry + 1))
+
         for reservation in result.get("Reservations", []):
+            instances_processed = 0
+
             for instance in reservation.get("Instances", []):
                 instance_id = instance["InstanceId"]
                 log.info("Handling instance %s", instance_id)
@@ -141,6 +162,14 @@ def check_instances(event, context) -> None:
                         log.info("Added volume %s to the processing queue",
                                  volume_id)
 
+                instances_processed += 1
+
+            cw.put_metric_data(Namespace=cloudwatch_namespace, MetricData=[{
+                "MetricName": "InstancesProcessed",
+                "Value": instances_processed,
+                "Unit": "Count",
+            }])
+
         next_token = result.get("NextToken")
         if not next_token:
             break
@@ -161,7 +190,7 @@ def check_volumes(event, context) -> None:
     # Keep paginating through the queue until we either run out of messages or
     # are about to have Lambda quit on us.
     while context.get_remaining_time_in_millis() > exit_time_millis:
-        messages = queue.receive_messages(MaxNumberOfMessages=1)
+        messages = queue.receive_messages(MaxNumberOfMessages=5)
         if not messages:
             break
 
@@ -197,8 +226,33 @@ def handle_volume_message(
     frequency = parse_duration_string(msg_body["Frequency"])
     retention = parse_duration_string(msg_body["Retention"])
 
+    # We use two CloudWatch dimensions: one with InstanceId set appropriately,
+    # another with InstanceId == "ALL" for aggregation.
+    dim0 = [{"Name": "InstanceId", "Value": instance_id}]
+    dim1 = [{"Name": "InstanceId", "Value": "ALL"}]
+
+    def count(name):
+        cw.put_metric_data(
+            Namespace=cloudwatch_namespace,
+            MetricData=[
+                {
+                    "MetricName": name,
+                    "Dimensions": dim0,
+                    "Value": 1,
+                    "Unit": "Count",
+                },
+                {
+                    "MetricName": name,
+                    "Dimensions": dim1,
+                    "Value": 1,
+                    "Unit": "Count",
+                },
+            ]
+        )
+
     if volume_id in processed_volumes:
         log.info("Skipping duplicate volume %s", volume_id)
+        count("VolumesSkipped")
         return
 
     processed_volumes.add(volume_id)
@@ -215,13 +269,11 @@ def handle_volume_message(
     # Record the latest snapshot, and whether any snapshots are in progress.
     latest_snapshot_time = datetime(year=1970, month=1, day=1)
     pending_snapshots = False
-    created_snapshots = 0
-    deleted_snapshots = 0
-    snapshot_errors = 0
 
     # Look for snapshots of this volume
     while True:
         result = ec2.describe_snapshots(**describe_kw)
+
         for snapshot in result.get("Snapshots", []):
             snapshot_id = snapshot["SnapshotId"]
             state = snapshot["State"]
@@ -235,6 +287,14 @@ def handle_volume_message(
                 delete_snapshot = True
             elif state == "completed":
                 start_time = snapshot["StartTime"]
+
+                # Make start_time offset-naive
+                start_time = datetime(
+                    year=start_time.year, month=start_time.month,
+                    day=start_time.day, hour=start_time.hour,
+                    minute=start_time.minute, second=start_time.second,
+                    microsecond=start_time.microsecond)
+
                 if start_time < datetime.utcnow() - retention:
                     log.info("Snapshot %s has expired; deleting it.",
                              snapshot_id)
@@ -245,11 +305,11 @@ def handle_volume_message(
             if delete_snapshot:
                 try:
                     ec2.delete_snapshot(SnapshotId=snapshot_id)
-                    deleted_snapshots += 1
+                    count("SnapshotsDeleted")
                 except Exception as e:
                     log.error("Failed to delete snapshot %s: %s", snapshot_id,
                               e, exc_info=True)
-                    snapshot_errors += 1
+                    count("SnapshotErrors")
 
         next_token = result.get("NextToken")
         if not next_token:
@@ -257,7 +317,8 @@ def handle_volume_message(
 
         describe_kw["NextToken"] = next_token
 
-    if latest_snapshot_time < datetime.utcnow() - frequency:
+    if (latest_snapshot_time < datetime.utcnow() - frequency and
+            not pending_snapshots):
         log.info("Creating new snapshot for volume %s", volume_id)
 
         # Note: GovCloud, as of this writing, doesn't support tag-on-create.
@@ -289,10 +350,10 @@ def handle_volume_message(
                 }
             ]
             ec2.create_tags(Resources=[snapshot_id], Tags=tags)
-            created_snapshots += 1
+            count("SnapshotsCreated")
         except Exception as e:
             log.error("Failed to create snapshot for %s: %s", volume_id, e,
                       exc_info=True)
-            snapshot_errors += 1
+            count("SnapshotErrors")
 
     return
