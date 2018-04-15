@@ -5,7 +5,7 @@ import json
 from logging import getLogger, DEBUG, INFO
 from os import environ
 from re import compile as re_compile
-from typing import Any, Dict
+from typing import Any, Dict, Set
 
 default_retention = environ.get("DEFAULT_RETENTION", "14d")
 frequency_tag_name = environ["FREQUENCY_TAG_NAME"]
@@ -156,6 +156,7 @@ def check_volumes(event, context) -> None:
     queue = sqs.Queue(volume_queue_url)
 
     n_succeeded = n_failed = 0
+    processed_volumes = set()
 
     # Keep paginating through the queue until we either run out of messages or
     # are about to have Lambda quit on us.
@@ -166,7 +167,7 @@ def check_volumes(event, context) -> None:
 
         for message in messages:
             try:
-                handle_volume_message(message)
+                handle_volume_message(message, processed_volumes)
                 n_succeeded += 1
             except Exception as e:
                 log.error("Failed to process message %s: %s",
@@ -177,9 +178,13 @@ def check_volumes(event, context) -> None:
 
     return
 
-def handle_volume_message(message: 'boto3.resources.factory.sqs.Message') -> None:
+def handle_volume_message(
+        message: 'boto3.resources.factory.sqs.Message',
+        processed_volumes: Set[str]) -> None:
     """
-    handle_volume_message(message: boto3.resources.factory.sqs.Message) -> None
+    handle_volume_message(
+        message: 'boto3.resources.factory.sqs.Message',
+        processed_volumes: Set[str]) -> None
     Handle an EBS volume message from SQS.
     """
     msg_body = json.loads(message.body)
@@ -191,6 +196,12 @@ def handle_volume_message(message: 'boto3.resources.factory.sqs.Message') -> Non
     device_name = msg_body["DeviceName"]
     frequency = parse_duration_string(msg_body["Frequency"])
     retention = parse_duration_string(msg_body["Retention"])
+
+    if volume_id in processed_volumes:
+        log.info("Skipping duplicate volume %s", volume_id)
+        return
+
+    processed_volumes.add(volume_id)
 
     describe_kw = {
         "Filters": [
